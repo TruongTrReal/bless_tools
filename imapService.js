@@ -5,169 +5,184 @@ const ImapParser = require('imap').parseHeader;
 function extractOtpFromSubject(subject) {
   const otpRegex = /- (\d{6,})/; // Looks for a 6-digit number after a hyphen
   const match = otpRegex.exec(subject);
-  if (match) {
-    return match[1]; // Return OTP
-  }
-  return null; // No OTP found
+  return match ? match[1] : null; // Return OTP or null if no OTP found
 }
 
 // Open the inbox
-function openInbox(imap, cb) {
-  imap.openBox('INBOX', false, cb); // `false` means we want to read and modify emails
-}
-
-// Function to fetch the latest unseen OTP for a single email
-function getLatestOtpForEmail(imapConfig, cb) {
-  const imap = new Imap(imapConfig);
-  const timeout = setTimeout(() => {
-    imap.end();
-    return cb(null, 'timeout');
-  }, 30000); // Timeout after 30 seconds
-
-  imap.once('ready', function() {
-    openInbox(imap, function(err, box) {
-      if (err) {
-        clearTimeout(timeout);
-        return cb('unexpected error');
-      }
-
-      // Check if the server supports the 'SORT' capability
-      if (imap.serverSupports('SORT')) {
-        // Sort messages by arrival time in reverse order (-ARRIVAL), and filter by 'UNSEEN' status
-        imap.sort([ '-ARRIVAL' ], [ 'UNSEEN' ], function(err, results) {
-          if (err || !results.length) {
-            clearTimeout(timeout);
-            return cb('No new messages');
-          }
-
-          // Fetch the most recent message (the first in the sorted list)
-          const f = imap.fetch(results[0], {
-            bodies: 'HEADER.FIELDS (FROM SUBJECT DATE)',
-            struct: true
-          });
-
-          f.on('message', function(msg, seqno) {
-            msg.on('body', function(stream, info) {
-              let buffer = '';
-              stream.on('data', function(chunk) {
-                buffer += chunk.toString('utf8');
-              });
-              stream.once('end', function() {
-                // Parse the email header
-                const header = ImapParser(buffer);
-                const otp = extractOtpFromSubject(header.subject[0]);
-                if (otp) {
-                  clearTimeout(timeout); // Clear timeout when OTP is found
-                  imap.end(); // Close connection after finding OTP
-                  return cb(null, otp); // Return the OTP
-                } else {
-                  clearTimeout(timeout);
-                  imap.end();
-                  return cb(null, 'no otp'); // No OTP found
-                }
-              });
-            });
-          });
-
-          f.once('error', function(err) {
-            clearTimeout(timeout);
-            imap.end();
-            return cb('unexpected error');
-          });
-
-          f.once('end', function() {
-            // Do nothing once fetching is complete
-          });
-        });
-      } else {
-        // Fallback if server doesn't support SORT
-        imap.search(['UNSEEN', ['FROM', 'no-reply@web3auth.io']], function(err, results) {
-          if (err || !results.length) {
-            clearTimeout(timeout);
-            return cb('No unseen messages');
-          }
-
-          const f = imap.fetch(results[results.length - 1], {
-            bodies: 'HEADER.FIELDS (FROM SUBJECT DATE)',
-            struct: true
-          });
-
-          f.on('message', function(msg, seqno) {
-            msg.on('body', function(stream, info) {
-              let buffer = '';
-              stream.on('data', function(chunk) {
-                buffer += chunk.toString('utf8');
-              });
-              stream.once('end', function() {
-                const header = ImapParser(buffer);
-                const otp = extractOtpFromSubject(header.subject[0]);
-                if (otp) {
-                  clearTimeout(timeout); // Clear timeout when OTP is found
-                  imap.end(); // Close connection after finding OTP
-                  return cb(null, otp); // Return the OTP
-                } else {
-                  clearTimeout(timeout);
-                  imap.end();
-                  return cb(null, 'no otp'); // No OTP found
-                }
-              });
-            });
-          });
-        });
-      }
+async function openInbox(imap) {
+  return new Promise((resolve, reject) => {
+    imap.openBox('INBOX', false, (err, box) => {
+      if (err) reject('Unexpected error');
+      resolve(box);
     });
   });
-
-  imap.once('error', function(err) {
-    clearTimeout(timeout);
-    console.log('IMAP Error: ' + err);
-    cb('unexpected error');
-  });
-
-  imap.once('end', function() {
-    // No further actions once connection ends
-  });
-
-  imap.connect();
 }
 
-// Function to handle multiple emails and fetch OTPs
-function getLatestOtpsForEmails(emails, cb) {
-  let results = {};
-  let remainingEmails = emails.length;
+// Fetch the latest unseen OTP for a single email
+async function getLatestOtpForEmail(imapConfig) {
+  const imap = new Imap(imapConfig);
+  
+  const timeout = setTimeout(() => {
+    imap.end();
+  }, 30000); // Timeout after 30 seconds
 
-  emails.forEach((email) => {
-    const { email: userEmail, password } = email;
+  return new Promise((resolve, reject) => {
+    imap.once('ready', async () => {
+      try {
+        const box = await openInbox(imap);
+        
+        // Check if the server supports the 'SORT' capability
+        if (imap.serverSupports('SORT')) {
+          // Sort messages by arrival time in reverse order (-ARRIVAL), and filter by 'UNSEEN' status
+          imap.sort(['-ARRIVAL'], ['UNSEEN'], (err, results) => {
+            if (err || !results.length) {
+              clearTimeout(timeout);
+              return resolve('No new messages');
+            }
 
+            // Fetch the most recent message (the first in the sorted list)
+            const f = imap.fetch(results[0], {
+              bodies: 'HEADER.FIELDS (FROM SUBJECT DATE)',
+              struct: true
+            });
+
+            f.on('message', (msg) => {
+              msg.on('body', (stream) => {
+                let buffer = '';
+                stream.on('data', (chunk) => {
+                  buffer += chunk.toString('utf8');
+                });
+
+                stream.once('end', () => {
+                  const header = ImapParser(buffer);
+                  const otp = extractOtpFromSubject(header.subject[0]);
+                  clearTimeout(timeout);
+                  imap.end();
+
+                  if (otp) {
+                    return resolve(otp); // Return the OTP if found
+                  } else {
+                    return resolve('no otp'); // No OTP found
+                  }
+                });
+              });
+            });
+
+            f.once('error', (err) => {
+              clearTimeout(timeout);
+              imap.end();
+              reject('Unexpected error');
+            });
+          });
+        } else {
+          // Fallback if server doesn't support SORT
+          imap.search(['UNSEEN', ['FROM', 'no-reply@web3auth.io']], (err, results) => {
+            if (err || !results.length) {
+              clearTimeout(timeout);
+              return resolve('No unseen messages');
+            }
+
+            const f = imap.fetch(results[results.length - 1], {
+              bodies: 'HEADER.FIELDS (FROM SUBJECT DATE)',
+              struct: true
+            });
+
+            f.on('message', (msg) => {
+              msg.on('body', (stream) => {
+                let buffer = '';
+                stream.on('data', (chunk) => {
+                  buffer += chunk.toString('utf8');
+                });
+
+                stream.once('end', () => {
+                  const header = ImapParser(buffer);
+                  const otp = extractOtpFromSubject(header.subject[0]);
+                  clearTimeout(timeout);
+                  imap.end();
+
+                  if (otp) {
+                    return resolve(otp); // Return the OTP if found
+                  } else {
+                    return resolve('no otp'); // No OTP found
+                  }
+                });
+              });
+            });
+
+            f.once('error', (err) => {
+              clearTimeout(timeout);
+              imap.end();
+              reject('Unexpected error');
+            });
+          });
+        }
+      } catch (error) {
+        clearTimeout(timeout);
+        reject(error);
+      }
+    });
+
+    imap.once('error', (err) => {
+      clearTimeout(timeout);
+      reject('IMAP Error: ' + err);
+    });
+
+    imap.once('end', () => {
+      // Do nothing once connection ends
+    });
+
+    imap.connect();
+  });
+}
+
+async function getLatestOtpsForEmails(emails) {
+  const results = {};
+
+  // Iterate over each email object
+  for (const { email: userEmail, password } of emails) {
+    const domain = userEmail.split('@')[1];
+    let host = '';
+    
+    // Determine the host based on the domain
+    if (domain === 'veer.vn') {
+      host = 'mail.veer.vn';
+    } else if (domain === 'tourzy.us' || domain === 'dealhot.vn') {
+      host = 'imap.bizflycloud.vn';
+    } else {
+      throw new Error('Unsupported email domain');
+    }
+
+    // IMAP configuration
     const imapConfig = {
       user: userEmail,
       password: password,
-      host: 'mail.veer.vn',
+      host: host,
       port: 993,
       tls: true
     };
 
-    getLatestOtpForEmail(imapConfig, (err, otp) => {
-      remainingEmails--;
+    try {
+      // Get OTP for the current email
+      const otp = await getLatestOtpForEmail(imapConfig);
 
-      if (err) {
-        results[userEmail] = { error: err };
+      // Handle OTP response
+      if (otp === 'no otp') {
+        results[userEmail] = { error: 'no otp' };
+      } else if (otp === 'timeout') {
+        results[userEmail] = { error: 'timeout' };
       } else {
-        if (otp === 'no otp') {
-          results[userEmail] = { error: 'no otp' };
-        } else if (otp === 'timeout') {
-          results[userEmail] = { error: 'timeout' };
-        } else {
-          results[userEmail] = { otp };
-        }
+        results[userEmail] = { otp };
       }
+    } catch (err) {
+      // Catch any errors and log them
+      results[userEmail] = { error: err.message || 'Unexpected error' };
+    }
+  }
 
-      if (remainingEmails === 0) {
-        return cb(null, results); // Return all results once all emails are processed
-      }
-    });
-  });
+  // Return the final results after processing all emails
+  return results;
 }
+
 
 module.exports = {
   getLatestOtpsForEmails

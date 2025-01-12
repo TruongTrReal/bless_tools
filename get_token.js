@@ -1,4 +1,5 @@
-const { Builder, By, Key, until } = require('selenium-webdriver');
+const { Builder, By, Key, until, Capabilities } = require('selenium-webdriver');
+const chrome = require('selenium-webdriver/chrome');
 const axios = require('axios');
 
 // Function to fetch OTP from the API using email and password
@@ -34,13 +35,16 @@ async function getOtpFromApi(email, password) {
   return null; // Return null if no OTP is fetched after retries
 }
 
-// Function to automate browser and retrieve the token
-async function getToken(email, password) {
+// Combined function to get both token and pubKey
+async function getTokenAndPubKey(email, password) {
   let driver;
   try {
-    console.log('Initializing WebDriver...');
-    // Initialize WebDriver (Make sure you have ChromeDriver installed)
-    driver = await new Builder().forBrowser('chrome').build();
+    // Set up Chrome options to include the extension (bless.crx)
+    const chromeOptions = new chrome.Options();
+    chromeOptions.addExtensions(['./bless.crx']);  // Path to your bless.crx extension file
+
+    // Initialize the WebDriver with the chrome options including the extension
+    driver = await new Builder().forBrowser('chrome').setChromeOptions(chromeOptions).build();
 
     // Go to the form page
     console.log('Navigating to the website...');
@@ -48,8 +52,8 @@ async function getToken(email, password) {
 
     console.log('Waiting for email input field...');
     // Enter the email in the email input field
-    await driver.wait(until.elementLocated(By.id('email')), 10000);
-    let emailInput = await driver.findElement(By.id('email'));
+    await driver.wait(until.elementLocated(By.xpath('//*[@id="email"]')), 10000);
+    let emailInput = await driver.findElement(By.xpath('//*[@id="email"]'));
     console.log('Entering email...');
     await emailInput.sendKeys(email);
     
@@ -119,8 +123,11 @@ async function getToken(email, password) {
         throw new Error('Token not found after 100 attempts');
       }
 
-      // Return the token
-      return token;
+      // Now fetch the pubKey using the token
+      const pubKey = await getPubKeyFromToken(token);
+
+      // Return both token and pubKey
+      return { token, pubKey };
     } else {
       throw new Error('OTP not found');
     }
@@ -135,9 +142,64 @@ async function getToken(email, password) {
   }
 }
 
+// Function to get pubKey using the token
+// Function to fetch pubKey from the API using the provided token
+async function getPubKeyFromToken(token) {
+  const maxRetries = 10;  // Set maximum number of retries
+  const retryDelay = 10000;  // Set retry delay in milliseconds (10 seconds)
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`Attempt ${attempt}: Fetching pubKey for token...`);
+
+      // Make the GET request to retrieve the nodes using the provided token
+      const response = await axios.get('https://gateway-run.bls.dev/api/v1/nodes', {
+        headers: {
+          'accept': '*/*',
+          'accept-language': 'en-US,en;q=0.9',
+          'authorization': `Bearer ${token}`,
+          'content-type': 'application/json',
+          'origin': 'https://bless.network',
+          'priority': 'u=1, i',
+          'referer': 'https://bless.network/',
+          'sec-ch-ua': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+          'sec-ch-ua-mobile': '?0',
+          'sec-ch-ua-platform': '"Windows"',
+          'sec-fetch-dest': 'empty',
+          'sec-fetch-mode': 'cors',
+          'sec-fetch-site': 'cross-site',
+          'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+        }
+      });
+
+      // Check if the response data is an array and contains at least one node
+      if (Array.isArray(response.data) && response.data.length > 0) {
+        const node = response.data[0];  // Select the first node
+        const pubKey = node.pubKey;  // Extract the pubKey from the node
+        console.log(`Public Key fetched successfully: ${pubKey}`);  // Log the public key
+        return pubKey;  // Return the pubKey
+      } else {
+        throw new Error('No nodes found in the response.');
+      }
+    } catch (error) {
+      console.error(`Error fetching pubKey on attempt ${attempt}:`, error.message);
+
+      // If it's the last attempt, throw the error
+      if (attempt === maxRetries) {
+        console.error('Max retries reached, unable to fetch pubKey.');
+        throw new Error('Unable to fetch pubKey after multiple attempts');
+      }
+
+      // Wait for the specified delay before retrying
+      console.log(`Retrying in ${retryDelay / 1000} seconds...`);
+      await new Promise(resolve => setTimeout(resolve, retryDelay));
+    }
+  }
+}
+
 // Utility function to pause execution for a specified amount of time
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-module.exports = { getToken }; // Export the function for use in app.js
+module.exports = { getTokenAndPubKey }; // Export the combined function for use in app.js
